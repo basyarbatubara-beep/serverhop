@@ -1,0 +1,1171 @@
+--[[
+    ========================================================================
+    HORIZON SERVER HOPPER • 1-PLAYER SOLO EDITION
+    ========================================================================
+    Purpose:
+    - Exclusively filters and joins servers with EXACTLY 1 PLAYER (Solo).
+    - Automatically finds the lowest-latency 1-player instance and joins it.
+    - Resilient fallback chain: If a 1-player server is closed or ghost
+      (Error 773), it automatically advances to the next 1-player instance
+      until you successfully join!
+    ========================================================================
+--]]
+
+-- Services
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local PlaceId = game.PlaceId
+local CurrentJobId = game.JobId
+
+-- Wait for PlayerGui
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Prevent duplicate instances
+if getgenv and getgenv().HorizonSoloHopInstance then
+    pcall(function()
+        getgenv().HorizonSoloHopInstance:Destroy()
+    end)
+    getgenv().HorizonSoloHopInstance = nil
+end
+
+-- ========================================================================
+-- UTILITIES & HELPERS
+-- ========================================================================
+
+local function tween(object, properties, duration, style, direction)
+    style = style or Enum.EasingStyle.Quad
+    direction = direction or Enum.EasingDirection.Out
+    duration = duration or 0.16
+    local t = TweenService:Create(object, TweenInfo.new(duration, style, direction), properties)
+    t:Play()
+    return t
+end
+
+local function setupHover(btn, normalColor, hoverColor)
+    btn.MouseEnter:Connect(function()
+        tween(btn, { BackgroundColor3 = hoverColor })
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, { BackgroundColor3 = normalColor })
+    end)
+end
+
+local function notify(title, message, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title or "Solo Hop",
+            Text = message or "",
+            Duration = duration or 3
+        })
+    end)
+end
+
+-- Resolve GUI Container
+local function getGuiContainer()
+    if typeof(gethui) == "function" then
+        local success, hui = pcall(gethui)
+        if success and hui then return hui end
+    end
+    local coreGuiSuccess, coreGui = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if coreGuiSuccess and coreGui then
+        local testSuccess = pcall(function()
+            local test = Instance.new("Folder")
+            test.Parent = coreGui
+            test:Destroy()
+        end)
+        if testSuccess then return coreGui end
+    end
+    return PlayerGui
+end
+
+-- Safe URL Encode
+local function safeUrlEncode(str)
+    if not str or str == "" then return "" end
+    if HttpService and HttpService.UrlEncode then
+        local s, res = pcall(function()
+            return HttpService:UrlEncode(str)
+        end)
+        if s and res then return res end
+    end
+    str = string.gsub(str, "\r\n", "\n")
+    str = string.gsub(str, "([^%w%-%_%.%~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+    return str
+end
+
+-- Robust HTTP Request
+local function httpRequest(url)
+    local requestFunc = nil
+    if typeof(syn) == "table" and typeof(syn.request) == "function" then
+        requestFunc = syn.request
+    elseif typeof(request) == "function" then
+        requestFunc = request
+    elseif typeof(http_request) == "function" then
+        requestFunc = http_request
+    elseif typeof(fluxus) == "table" and typeof(fluxus.request) == "function" then
+        requestFunc = fluxus.request
+    end
+
+    if requestFunc then
+        local success, response = pcall(function()
+            return requestFunc({
+                Url = url,
+                Method = "GET",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                    ["User-Agent"] = "Roblox/WinInet"
+                }
+            })
+        end)
+        if success and response and response.Body then
+            return response.Body
+        end
+    end
+
+    if game and game.HttpGet then
+        local success, result = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if success and result then
+            return result
+        end
+    end
+
+    return nil, "HTTP request failed"
+end
+
+-- Clipboard
+local function copyToClipboard(text)
+    if setclipboard then
+        setclipboard(text)
+        return true
+    elseif toclipboard then
+        toclipboard(text)
+        return true
+    elseif syn and syn.write_clipboard then
+        syn.write_clipboard(text)
+        return true
+    elseif Clipboard and Clipboard.set then
+        Clipboard.set(text)
+        return true
+    end
+    return false
+end
+
+-- Draggable implementation
+local function makeDraggable(dragHandle, targetFrame)
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = targetFrame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    dragHandle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            if dragging then
+                local delta = input.Position - dragStart
+                targetFrame.Position = UDim2.new(
+                    startPos.X.Scale,
+                    startPos.X.Offset + delta.X,
+                    startPos.Y.Scale,
+                    startPos.Y.Offset + delta.Y
+                )
+            end
+        end
+    end)
+end
+
+-- Teleport confirmation queue
+local function setupQueueOnTeleport()
+    local queueFunc = (syn and syn.queue_on_teleport) or queue_on_teleport or (fluxus and fluxus.queue_on_teleport)
+    if queueFunc then
+        pcall(function()
+            queueFunc([[
+                task.spawn(function()
+                    repeat task.wait(0.5) until game:IsLoaded()
+                    local StarterGui = game:GetService("StarterGui")
+                    task.wait(1.2)
+                    pcall(function()
+                        StarterGui:SetCore("SendNotification", {
+                            Title = "Solo Server",
+                            Text = "Successfully joined 1-player server!",
+                            Duration = 5
+                        })
+                    end)
+                end)
+            ]])
+        end)
+    end
+end
+
+-- Game Info
+local gameTitle = "Place " .. tostring(PlaceId)
+task.spawn(function()
+    local success, productInfo = pcall(function()
+        return MarketplaceService:GetProductInfo(PlaceId)
+    end)
+    if success and productInfo and productInfo.Name then
+        gameTitle = productInfo.Name
+    end
+end)
+
+-- State Variables (Strictly 1-Player Solo)
+local loadedSoloServers = {}
+local blacklistServers = {}
+local nextPageCursor = ""
+local isFetching = false
+local isJoining = false
+local currentJoinIndex = 1
+local soloCandidates = {}
+
+-- Forward references
+local setStatus = nil
+local renderSoloList = nil
+local stopJoining = nil
+local executeJoinAttempt = nil
+local startSoloJoin = nil
+-- ========================================================================
+-- USER INTERFACE (CLEAN 1-PLAYER SOLO THEME)
+-- ========================================================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "Horizon1PlayerSoloGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 999
+ScreenGui.Parent = getGuiContainer()
+
+if getgenv then
+    getgenv().HorizonSoloHopInstance = ScreenGui
+end
+
+-- Main Viewport Window
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 500, 0, 480)
+MainFrame.Position = UDim2.new(0.5, -250, 0.5, -240)
+MainFrame.BackgroundColor3 = Color3.fromRGB(12, 13, 18)
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 10)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(36, 40, 54)
+MainStroke.Thickness = 1
+MainStroke.Parent = MainFrame
+
+-- Header Bar
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.new(1, 0, 0, 52)
+Header.BackgroundColor3 = Color3.fromRGB(17, 19, 26)
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+
+local HeaderCorner = Instance.new("UICorner")
+HeaderCorner.CornerRadius = UDim.new(0, 10)
+HeaderCorner.Parent = Header
+
+local HeaderDivider = Instance.new("Frame")
+HeaderDivider.Size = UDim2.new(1, 0, 0, 1)
+HeaderDivider.Position = UDim2.new(0, 0, 1, -1)
+HeaderDivider.BackgroundColor3 = Color3.fromRGB(28, 32, 44)
+HeaderDivider.BorderSizePixel = 0
+HeaderDivider.Parent = Header
+
+local BrandDot = Instance.new("Frame")
+BrandDot.Size = UDim2.new(0, 8, 0, 8)
+BrandDot.Position = UDim2.new(0, 16, 0, 17)
+BrandDot.BackgroundColor3 = Color3.fromRGB(139, 92, 246)
+BrandDot.BorderSizePixel = 0
+BrandDot.Parent = Header
+
+local BrandDotCorner = Instance.new("UICorner")
+BrandDotCorner.CornerRadius = UDim.new(1, 0)
+BrandDotCorner.Parent = BrandDot
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "TitleLabel"
+TitleLabel.Size = UDim2.new(0, 95, 0, 20)
+TitleLabel.Position = UDim2.new(0, 32, 0, 10)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.Text = "ServerHop"
+TitleLabel.TextColor3 = Color3.fromRGB(242, 244, 250)
+TitleLabel.TextSize = 14
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = Header
+
+local VersionBadge = Instance.new("TextLabel")
+VersionBadge.Size = UDim2.new(0, 52, 0, 16)
+VersionBadge.Position = UDim2.new(0, 130, 0, 12)
+VersionBadge.BackgroundColor3 = Color3.fromRGB(45, 32, 75)
+VersionBadge.BorderSizePixel = 0
+VersionBadge.Font = Enum.Font.GothamBold
+VersionBadge.Text = "SOLO 1P"
+VersionBadge.TextColor3 = Color3.fromRGB(192, 132, 252)
+VersionBadge.TextSize = 9
+VersionBadge.Parent = Header
+
+local BadgeCorner = Instance.new("UICorner")
+BadgeCorner.CornerRadius = UDim.new(0, 4)
+BadgeCorner.Parent = VersionBadge
+
+local SubtitleLabel = Instance.new("TextLabel")
+SubtitleLabel.Name = "SubtitleLabel"
+SubtitleLabel.Size = UDim2.new(1, -220, 0, 15)
+SubtitleLabel.Position = UDim2.new(0, 32, 0, 30)
+SubtitleLabel.BackgroundTransparency = 1
+SubtitleLabel.Font = Enum.Font.Gotham
+SubtitleLabel.Text = "Exclusively targeting 1-player instances..."
+SubtitleLabel.TextColor3 = Color3.fromRGB(130, 137, 155)
+SubtitleLabel.TextSize = 11
+SubtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+SubtitleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+SubtitleLabel.Parent = Header
+
+task.spawn(function()
+    task.wait(0.4)
+    local curPlayers = #Players:GetPlayers()
+    SubtitleLabel.Text = string.format("%s  •  Current: %d players", gameTitle, curPlayers)
+end)
+
+-- Window Controls
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Name = "CloseBtn"
+CloseBtn.Size = UDim2.new(0, 28, 0, 28)
+CloseBtn.Position = UDim2.new(1, -38, 0, 12)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(24, 27, 38)
+CloseBtn.BorderSizePixel = 0
+CloseBtn.Font = Enum.Font.GothamMedium
+CloseBtn.Text = "×"
+CloseBtn.TextColor3 = Color3.fromRGB(160, 165, 180)
+CloseBtn.TextSize = 16
+CloseBtn.Parent = Header
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 6)
+CloseCorner.Parent = CloseBtn
+
+local CloseStroke = Instance.new("UIStroke")
+CloseStroke.Color = Color3.fromRGB(36, 40, 56)
+CloseStroke.Thickness = 1
+CloseStroke.Parent = CloseBtn
+
+setupHover(CloseBtn, Color3.fromRGB(24, 27, 38), Color3.fromRGB(45, 25, 30))
+CloseBtn.MouseEnter:Connect(function()
+    tween(CloseBtn, { TextColor3 = Color3.fromRGB(248, 113, 113) })
+end)
+CloseBtn.MouseLeave:Connect(function()
+    tween(CloseBtn, { TextColor3 = Color3.fromRGB(160, 165, 180) })
+end)
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Name = "MinimizeBtn"
+MinimizeBtn.Size = UDim2.new(0, 28, 0, 28)
+MinimizeBtn.Position = UDim2.new(1, -72, 0, 12)
+MinimizeBtn.BackgroundColor3 = Color3.fromRGB(24, 27, 38)
+MinimizeBtn.BorderSizePixel = 0
+MinimizeBtn.Font = Enum.Font.GothamMedium
+MinimizeBtn.Text = "−"
+MinimizeBtn.TextColor3 = Color3.fromRGB(160, 165, 180)
+MinimizeBtn.TextSize = 16
+MinimizeBtn.Parent = Header
+
+local MinimizeCorner = Instance.new("UICorner")
+MinimizeCorner.CornerRadius = UDim.new(0, 6)
+MinimizeCorner.Parent = MinimizeBtn
+
+local MinimizeStroke = Instance.new("UIStroke")
+MinimizeStroke.Color = Color3.fromRGB(36, 40, 56)
+MinimizeStroke.Thickness = 1
+MinimizeStroke.Parent = MinimizeBtn
+
+setupHover(MinimizeBtn, Color3.fromRGB(24, 27, 38), Color3.fromRGB(32, 36, 50))
+
+makeDraggable(Header, MainFrame)
+
+-- Floating Toggle Pill
+local TogglePill = Instance.new("TextButton")
+TogglePill.Name = "TogglePill"
+TogglePill.Size = UDim2.new(0, 130, 0, 36)
+TogglePill.Position = UDim2.new(0, 20, 0, 90)
+TogglePill.BackgroundColor3 = Color3.fromRGB(17, 19, 26)
+TogglePill.BorderSizePixel = 0
+TogglePill.Font = Enum.Font.GothamBold
+TogglePill.Text = "  Solo (1P)"
+TogglePill.TextColor3 = Color3.fromRGB(240, 243, 250)
+TogglePill.TextSize = 12
+TogglePill.Visible = false
+TogglePill.Parent = ScreenGui
+
+local PillCorner = Instance.new("UICorner")
+PillCorner.CornerRadius = UDim.new(0, 18)
+PillCorner.Parent = TogglePill
+
+local PillStroke = Instance.new("UIStroke")
+PillStroke.Color = Color3.fromRGB(139, 92, 246)
+PillStroke.Thickness = 1.2
+PillStroke.Parent = TogglePill
+
+local PillDot = Instance.new("Frame")
+PillDot.Size = UDim2.new(0, 8, 0, 8)
+PillDot.Position = UDim2.new(0, 14, 0.5, -4)
+PillDot.BackgroundColor3 = Color3.fromRGB(192, 132, 252)
+PillDot.BorderSizePixel = 0
+PillDot.Parent = TogglePill
+
+local PillDotCorner = Instance.new("UICorner")
+PillDotCorner.CornerRadius = UDim.new(1, 0)
+PillDotCorner.Parent = PillDot
+
+makeDraggable(TogglePill, TogglePill)
+
+local function toggleMainWindow(visible)
+    if visible == nil then
+        MainFrame.Visible = not MainFrame.Visible
+    else
+        MainFrame.Visible = visible
+    end
+    TogglePill.Visible = not MainFrame.Visible
+end
+
+CloseBtn.MouseButton1Click:Connect(function()
+    toggleMainWindow(false)
+end)
+
+MinimizeBtn.MouseButton1Click:Connect(function()
+    toggleMainWindow(false)
+end)
+
+TogglePill.MouseButton1Click:Connect(function()
+    toggleMainWindow(true)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed and input.KeyCode == Enum.KeyCode.RightControl then
+        toggleMainWindow()
+    end
+end)
+
+-- Primary Action Bar
+local HeroBar = Instance.new("Frame")
+HeroBar.Name = "HeroBar"
+HeroBar.Size = UDim2.new(1, -28, 0, 42)
+HeroBar.Position = UDim2.new(0, 14, 0, 64)
+HeroBar.BackgroundTransparency = 1
+HeroBar.Parent = MainFrame
+
+-- Auto Join 1-Player Button
+local AutoJoinSoloBtn = Instance.new("TextButton")
+AutoJoinSoloBtn.Name = "AutoJoinSoloBtn"
+AutoJoinSoloBtn.Size = UDim2.new(0.70, -4, 1, 0)
+AutoJoinSoloBtn.Position = UDim2.new(0, 0, 0, 0)
+AutoJoinSoloBtn.BackgroundColor3 = Color3.fromRGB(124, 58, 237)
+AutoJoinSoloBtn.BorderSizePixel = 0
+AutoJoinSoloBtn.Font = Enum.Font.GothamBold
+AutoJoinSoloBtn.Text = "Join 1-Player Server (Auto)"
+AutoJoinSoloBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoJoinSoloBtn.TextSize = 12
+AutoJoinSoloBtn.Parent = HeroBar
+
+local AutoJoinCorner = Instance.new("UICorner")
+AutoJoinCorner.CornerRadius = UDim.new(0, 8)
+AutoJoinCorner.Parent = AutoJoinSoloBtn
+
+local AutoJoinStroke = Instance.new("UIStroke")
+AutoJoinStroke.Color = Color3.fromRGB(147, 51, 234)
+AutoJoinStroke.Thickness = 1
+AutoJoinStroke.Parent = AutoJoinSoloBtn
+
+setupHover(AutoJoinSoloBtn, Color3.fromRGB(124, 58, 237), Color3.fromRGB(139, 92, 246))
+
+-- Refresh Button
+local RefreshBtn = Instance.new("TextButton")
+RefreshBtn.Name = "RefreshBtn"
+RefreshBtn.Size = UDim2.new(0.30, -4, 1, 0)
+RefreshBtn.Position = UDim2.new(0.70, 4, 0, 0)
+RefreshBtn.BackgroundColor3 = Color3.fromRGB(22, 25, 34)
+RefreshBtn.BorderSizePixel = 0
+RefreshBtn.Font = Enum.Font.GothamMedium
+RefreshBtn.Text = "Refresh"
+RefreshBtn.TextColor3 = Color3.fromRGB(220, 225, 238)
+RefreshBtn.TextSize = 12
+RefreshBtn.Parent = HeroBar
+
+local RefreshCorner = Instance.new("UICorner")
+RefreshCorner.CornerRadius = UDim.new(0, 8)
+RefreshCorner.Parent = RefreshBtn
+
+local RefreshStroke = Instance.new("UIStroke")
+RefreshStroke.Color = Color3.fromRGB(36, 40, 56)
+RefreshStroke.Thickness = 1
+RefreshStroke.Parent = RefreshBtn
+
+setupHover(RefreshBtn, Color3.fromRGB(22, 25, 34), Color3.fromRGB(30, 35, 48))
+
+-- Info / Filter Bar
+local InfoBar = Instance.new("Frame")
+InfoBar.Name = "InfoBar"
+InfoBar.Size = UDim2.new(1, -28, 0, 28)
+InfoBar.Position = UDim2.new(0, 14, 0, 114)
+InfoBar.BackgroundTransparency = 1
+InfoBar.Parent = MainFrame
+
+local ModeDescLabel = Instance.new("TextLabel")
+ModeDescLabel.Size = UDim2.new(1, -95, 1, 0)
+ModeDescLabel.Position = UDim2.new(0, 0, 0, 0)
+ModeDescLabel.BackgroundTransparency = 1
+ModeDescLabel.Font = Enum.Font.GothamMedium
+ModeDescLabel.Text = "Exclusively filtered to servers with exactly 1 player"
+ModeDescLabel.TextColor3 = Color3.fromRGB(165, 180, 252)
+ModeDescLabel.TextSize = 11
+ModeDescLabel.TextXAlignment = Enum.TextXAlignment.Left
+ModeDescLabel.Parent = InfoBar
+
+local LoadMoreBtn = Instance.new("TextButton")
+LoadMoreBtn.Name = "LoadMoreBtn"
+LoadMoreBtn.Size = UDim2.new(0, 85, 0, 24)
+LoadMoreBtn.Position = UDim2.new(1, -85, 0, 2)
+LoadMoreBtn.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
+LoadMoreBtn.BorderSizePixel = 0
+LoadMoreBtn.Font = Enum.Font.GothamMedium
+LoadMoreBtn.Text = "Load More"
+LoadMoreBtn.TextColor3 = Color3.fromRGB(180, 186, 205)
+LoadMoreBtn.TextSize = 10
+LoadMoreBtn.Parent = InfoBar
+
+local LoadMoreCorner = Instance.new("UICorner")
+LoadMoreCorner.CornerRadius = UDim.new(0, 5)
+LoadMoreCorner.Parent = LoadMoreBtn
+
+local LoadMoreStroke = Instance.new("UIStroke")
+LoadMoreStroke.Color = Color3.fromRGB(36, 40, 56)
+LoadMoreStroke.Thickness = 1
+LoadMoreStroke.Parent = LoadMoreBtn
+
+setupHover(LoadMoreBtn, Color3.fromRGB(18, 20, 28), Color3.fromRGB(28, 32, 44))
+
+-- Server Cards Scroll Container
+local ScrollContainer = Instance.new("ScrollingFrame")
+ScrollContainer.Name = "ScrollContainer"
+ScrollContainer.Size = UDim2.new(1, -28, 1, -182)
+ScrollContainer.Position = UDim2.new(0, 14, 0, 148)
+ScrollContainer.BackgroundColor3 = Color3.fromRGB(14, 15, 21)
+ScrollContainer.BorderSizePixel = 0
+ScrollContainer.ScrollBarThickness = 4
+ScrollContainer.ScrollBarImageColor3 = Color3.fromRGB(60, 66, 85)
+ScrollContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+ScrollContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ScrollContainer.Parent = MainFrame
+
+local ScrollCorner = Instance.new("UICorner")
+ScrollCorner.CornerRadius = UDim.new(0, 8)
+ScrollCorner.Parent = ScrollContainer
+
+local ScrollStroke = Instance.new("UIStroke")
+ScrollStroke.Color = Color3.fromRGB(26, 29, 40)
+ScrollStroke.Thickness = 1
+ScrollStroke.Parent = ScrollContainer
+
+local ListLayout = Instance.new("UIListLayout")
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ListLayout.Padding = UDim.new(0, 6)
+ListLayout.Parent = ScrollContainer
+
+local ListPadding = Instance.new("UIPadding")
+ListPadding.PaddingTop = UDim.new(0, 8)
+ListPadding.PaddingBottom = UDim.new(0, 8)
+ListPadding.PaddingLeft = UDim.new(0, 8)
+ListPadding.PaddingRight = UDim.new(0, 8)
+ListPadding.Parent = ScrollContainer
+
+local EmptyLabel = Instance.new("TextLabel")
+EmptyLabel.Name = "EmptyLabel"
+EmptyLabel.Size = UDim2.new(1, 0, 0, 100)
+EmptyLabel.BackgroundTransparency = 1
+EmptyLabel.Font = Enum.Font.GothamMedium
+EmptyLabel.Text = "Scanning for servers with only 1 player..."
+EmptyLabel.TextColor3 = Color3.fromRGB(120, 126, 145)
+EmptyLabel.TextSize = 12
+EmptyLabel.Visible = true
+EmptyLabel.Parent = ScrollContainer
+
+-- Bottom Footer Status Bar
+local FooterBar = Instance.new("Frame")
+FooterBar.Name = "FooterBar"
+FooterBar.Size = UDim2.new(1, 0, 0, 28)
+FooterBar.Position = UDim2.new(0, 0, 1, -28)
+FooterBar.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+FooterBar.BorderSizePixel = 0
+FooterBar.Parent = MainFrame
+
+local FooterTopLine = Instance.new("Frame")
+FooterTopLine.Size = UDim2.new(1, 0, 0, 1)
+FooterTopLine.Position = UDim2.new(0, 0, 0, 0)
+FooterTopLine.BackgroundColor3 = Color3.fromRGB(24, 27, 38)
+FooterTopLine.BorderSizePixel = 0
+FooterTopLine.Parent = FooterBar
+
+local StatusDot = Instance.new("Frame")
+StatusDot.Name = "StatusDot"
+StatusDot.Size = UDim2.new(0, 6, 0, 6)
+StatusDot.Position = UDim2.new(0, 16, 0.5, -3)
+StatusDot.BackgroundColor3 = Color3.fromRGB(192, 132, 252)
+StatusDot.BorderSizePixel = 0
+StatusDot.Parent = FooterBar
+
+local StatusDotCorner = Instance.new("UICorner")
+StatusDotCorner.CornerRadius = UDim.new(1, 0)
+StatusDotCorner.Parent = StatusDot
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Name = "StatusLabel"
+StatusLabel.Size = UDim2.new(1, -34, 1, 0)
+StatusLabel.Position = UDim2.new(0, 28, 0, 0)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.Text = "Searching 1-player servers..."
+StatusLabel.TextColor3 = Color3.fromRGB(140, 146, 165)
+StatusLabel.TextSize = 11
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+StatusLabel.Parent = FooterBar
+
+setStatus = function(text, color)
+    StatusLabel.Text = text
+    StatusLabel.TextColor3 = color or Color3.fromRGB(140, 146, 165)
+    if color == Color3.fromRGB(239, 68, 68) or color == Color3.fromRGB(248, 113, 113) then
+        StatusDot.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+    elseif color == Color3.fromRGB(245, 158, 11) or color == Color3.fromRGB(251, 191, 36) then
+        StatusDot.BackgroundColor3 = Color3.fromRGB(245, 158, 11)
+    else
+        StatusDot.BackgroundColor3 = Color3.fromRGB(192, 132, 252)
+    end
+end
+-- ========================================================================
+-- 1-PLAYER SERVER CARD CREATION
+-- ========================================================================
+
+local function createServerCard(serverData, index)
+    local isCurrent = (serverData.id == CurrentJobId)
+    local isBlacklisted = (blacklistServers[serverData.id] == true)
+    local playing = serverData.playing or 0
+    local maxPlayers = serverData.maxPlayers or 0
+    local pingNum = serverData.ping and math.floor(serverData.ping) or nil
+    local pingText = pingNum and string.format("%d ms", pingNum) or "N/A"
+    local fpsText = serverData.fps and string.format("%.0f fps", serverData.fps) or "60 fps"
+    local shortId = string.sub(serverData.id or "unknown", 1, 8)
+
+    local Card = Instance.new("Frame")
+    Card.Name = "SoloCard_" .. tostring(index)
+    Card.Size = UDim2.new(1, 0, 0, 58)
+    Card.BackgroundColor3 = isCurrent and Color3.fromRGB(24, 28, 40) or Color3.fromRGB(19, 21, 29)
+    Card.BorderSizePixel = 0
+    Card.LayoutOrder = index
+    Card.Parent = ScrollContainer
+
+    local CardCorner = Instance.new("UICorner")
+    CardCorner.CornerRadius = UDim.new(0, 8)
+    CardCorner.Parent = Card
+
+    local CardStroke = Instance.new("UIStroke")
+    if isCurrent then
+        CardStroke.Color = Color3.fromRGB(99, 102, 241)
+    elseif isBlacklisted then
+        CardStroke.Color = Color3.fromRGB(120, 40, 45)
+    else
+        CardStroke.Color = Color3.fromRGB(79, 70, 229)
+    end
+    CardStroke.Thickness = 1
+    CardStroke.Parent = Card
+
+    Card.MouseEnter:Connect(function()
+        if not isCurrent and not isBlacklisted then
+            tween(Card, { BackgroundColor3 = Color3.fromRGB(23, 26, 36) })
+            tween(CardStroke, { Color = Color3.fromRGB(139, 92, 246) })
+        end
+    end)
+    Card.MouseLeave:Connect(function()
+        if not isCurrent and not isBlacklisted then
+            tween(Card, { BackgroundColor3 = Color3.fromRGB(19, 21, 29) })
+            tween(CardStroke, { Color = Color3.fromRGB(79, 70, 229) })
+        end
+    end)
+
+    -- Ping indicator dot
+    local PingDot = Instance.new("Frame")
+    PingDot.Size = UDim2.new(0, 6, 0, 6)
+    PingDot.Position = UDim2.new(0, 12, 0, 15)
+    PingDot.BorderSizePixel = 0
+    PingDot.Parent = Card
+
+    if pingNum and pingNum <= 100 then
+        PingDot.BackgroundColor3 = Color3.fromRGB(52, 211, 153)
+    elseif pingNum and pingNum <= 200 then
+        PingDot.BackgroundColor3 = Color3.fromRGB(251, 191, 36)
+    else
+        PingDot.BackgroundColor3 = Color3.fromRGB(248, 113, 113)
+    end
+
+    local PingDotCorner = Instance.new("UICorner")
+    PingDotCorner.CornerRadius = UDim.new(1, 0)
+    PingDotCorner.Parent = PingDot
+
+    -- 1-Player Badge
+    local SoloTag = Instance.new("TextLabel")
+    SoloTag.Size = UDim2.new(0, 72, 0, 18)
+    SoloTag.Position = UDim2.new(0, 24, 0, 9)
+    SoloTag.BackgroundColor3 = Color3.fromRGB(48, 36, 85)
+    SoloTag.BorderSizePixel = 0
+    SoloTag.Font = Enum.Font.GothamBold
+    SoloTag.Text = "1 PLAYER"
+    SoloTag.TextColor3 = Color3.fromRGB(192, 132, 252)
+    SoloTag.TextSize = 9
+    SoloTag.Parent = Card
+
+    local SoloTagCorner = Instance.new("UICorner")
+    SoloTagCorner.CornerRadius = UDim.new(0, 4)
+    SoloTagCorner.Parent = SoloTag
+
+    -- Player Count Label
+    local PlayerLabel = Instance.new("TextLabel")
+    PlayerLabel.Size = UDim2.new(0, 150, 0, 18)
+    PlayerLabel.Position = UDim2.new(0, 102, 0, 9)
+    PlayerLabel.BackgroundTransparency = 1
+    PlayerLabel.Font = Enum.Font.GothamBold
+    PlayerLabel.Text = string.format("1 / %d Players", maxPlayers)
+    PlayerLabel.TextColor3 = Color3.fromRGB(240, 243, 250)
+    PlayerLabel.TextSize = 12
+    PlayerLabel.TextXAlignment = Enum.TextXAlignment.Left
+    PlayerLabel.Parent = Card
+
+    -- Metrics Subtitle
+    local InfoLabel = Instance.new("TextLabel")
+    InfoLabel.Size = UDim2.new(1, -210, 0, 16)
+    InfoLabel.Position = UDim2.new(0, 12, 0, 32)
+    InfoLabel.BackgroundTransparency = 1
+    InfoLabel.Font = Enum.Font.Gotham
+    InfoLabel.Text = string.format("Ping: %s  •  FPS: %s  •  ID: %s", pingText, fpsText, shortId)
+    InfoLabel.TextColor3 = Color3.fromRGB(120, 126, 145)
+    InfoLabel.TextSize = 10
+    InfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+    InfoLabel.Parent = Card
+
+    -- Copy GUID Button
+    local CopyBtn = Instance.new("TextButton")
+    CopyBtn.Name = "CopyBtn"
+    CopyBtn.Size = UDim2.new(0, 56, 0, 26)
+    CopyBtn.Position = UDim2.new(1, -146, 0, 16)
+    CopyBtn.BackgroundColor3 = Color3.fromRGB(26, 29, 39)
+    CopyBtn.BorderSizePixel = 0
+    CopyBtn.Font = Enum.Font.GothamMedium
+    CopyBtn.Text = "Copy"
+    CopyBtn.TextColor3 = Color3.fromRGB(180, 185, 202)
+    CopyBtn.TextSize = 11
+    CopyBtn.Parent = Card
+
+    local CopyCorner = Instance.new("UICorner")
+    CopyCorner.CornerRadius = UDim.new(0, 6)
+    CopyCorner.Parent = CopyBtn
+
+    local CopyStroke = Instance.new("UIStroke")
+    CopyStroke.Color = Color3.fromRGB(36, 40, 56)
+    CopyStroke.Thickness = 1
+    CopyStroke.Parent = CopyBtn
+
+    setupHover(CopyBtn, Color3.fromRGB(26, 29, 39), Color3.fromRGB(36, 41, 56))
+
+    CopyBtn.MouseButton1Click:Connect(function()
+        local copied = copyToClipboard(serverData.id)
+        if copied then
+            CopyBtn.Text = "Done"
+            CopyBtn.TextColor3 = Color3.fromRGB(52, 211, 153)
+            task.delay(1.4, function()
+                CopyBtn.Text = "Copy"
+                CopyBtn.TextColor3 = Color3.fromRGB(180, 185, 202)
+            end)
+        end
+    end)
+
+    -- Join Button
+    local JoinBtn = Instance.new("TextButton")
+    JoinBtn.Name = "JoinBtn"
+    JoinBtn.Size = UDim2.new(0, 76, 0, 26)
+    JoinBtn.Position = UDim2.new(1, -84, 0, 16)
+    JoinBtn.BorderSizePixel = 0
+    JoinBtn.Font = Enum.Font.GothamBold
+    JoinBtn.TextSize = 11
+    JoinBtn.Parent = Card
+
+    local JoinCorner = Instance.new("UICorner")
+    JoinCorner.CornerRadius = UDim.new(0, 6)
+    JoinCorner.Parent = JoinBtn
+
+    if isCurrent then
+        JoinBtn.BackgroundColor3 = Color3.fromRGB(34, 38, 50)
+        JoinBtn.Text = "Current"
+        JoinBtn.TextColor3 = Color3.fromRGB(130, 136, 155)
+        JoinBtn.AutoButtonColor = false
+    elseif isBlacklisted then
+        JoinBtn.BackgroundColor3 = Color3.fromRGB(48, 25, 28)
+        JoinBtn.Text = "Closed"
+        JoinBtn.TextColor3 = Color3.fromRGB(248, 113, 113)
+        JoinBtn.AutoButtonColor = false
+    else
+        JoinBtn.BackgroundColor3 = Color3.fromRGB(124, 58, 237)
+        JoinBtn.Text = "Join Solo"
+        JoinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+
+        setupHover(JoinBtn, Color3.fromRGB(124, 58, 237), Color3.fromRGB(139, 92, 246))
+
+        JoinBtn.MouseButton1Click:Connect(function()
+            if isJoining then return end
+            JoinBtn.Text = "..."
+            setStatus(string.format("Connecting to 1-player server (Ping: %s)...", pingText), Color3.fromRGB(245, 158, 11))
+            notify("Solo Server", "Connecting to 1-player server...", 3)
+
+            setupQueueOnTeleport()
+
+            local success, err = pcall(function()
+                TeleportService:TeleportToPlaceInstance(PlaceId, serverData.id, LocalPlayer)
+            end)
+
+            if not success then
+                blacklistServers[serverData.id] = true
+                JoinBtn.Text = "Failed"
+                JoinBtn.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+                setStatus("Connection failed: " .. tostring(err), Color3.fromRGB(239, 68, 68))
+                notify("Failed", "Server is inaccessible or closed.", 3)
+                task.delay(2, function()
+                    JoinBtn.Text = "Join Solo"
+                    JoinBtn.BackgroundColor3 = Color3.fromRGB(124, 58, 237)
+                end)
+            end
+        end)
+    end
+
+    return Card
+end
+
+-- Render Server Cards to ScrollContainer (Strictly 1 Player)
+renderSoloList = function()
+    for _, child in ipairs(ScrollContainer:GetChildren()) do
+        if child:IsA("Frame") and child.Name:sub(1, 9) == "SoloCard_" then
+            child:Destroy()
+        end
+    end
+
+    local filtered = {}
+
+    for _, srv in ipairs(loadedSoloServers) do
+        if (srv.playing == 1) and (srv.id ~= CurrentJobId) and not blacklistServers[srv.id] then
+            table.insert(filtered, srv)
+        end
+    end
+
+    -- Strict sort: lowest latency (ping) first
+    table.sort(filtered, function(a, b)
+        local aPing = a.ping or 9999
+        local bPing = b.ping or 9999
+        return aPing < bPing
+    end)
+
+    if #filtered == 0 then
+        EmptyLabel.Visible = true
+        EmptyLabel.Text = (isFetching and "Scanning for 1-player instances..." or "No 1-player servers found yet. Click Refresh to scan.")
+    else
+        EmptyLabel.Visible = false
+        for index, srv in ipairs(filtered) do
+            createServerCard(srv, index)
+        end
+    end
+
+    if not isJoining then
+        setStatus(string.format("%d 1-player servers found (sorted by ping)", #filtered), Color3.fromRGB(140, 146, 165))
+    end
+end
+
+-- ========================================================================
+-- ROBLOX API FETCHING (EXCLUSIVELY 1-PLAYER FILTER)
+-- ========================================================================
+
+local function fetchRobloxServers(cursor, onComplete)
+    if isFetching then return end
+    isFetching = true
+    setStatus("Scanning Roblox for 1-player servers...", Color3.fromRGB(192, 132, 252))
+    EmptyLabel.Text = "Scanning for 1-player servers..."
+    EmptyLabel.Visible = true
+
+    task.spawn(function()
+        local cursorParam = (cursor and cursor ~= "") and ("&cursor=" .. safeUrlEncode(cursor)) or ""
+        local url = string.format(
+            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100%s",
+            tostring(PlaceId),
+            cursorParam
+        )
+
+        local body = nil
+        for attempt = 1, 2 do
+            body = httpRequest(url)
+            if body and body ~= "" and not string.find(body, "Too Many Requests") then
+                break
+            end
+            task.wait(1.5)
+        end
+
+        isFetching = false
+
+        if not body then
+            setStatus("Network error querying servers.", Color3.fromRGB(239, 68, 68))
+            EmptyLabel.Text = "Failed to query servers. Check executor HTTP support."
+            if onComplete then onComplete(false) end
+            return
+        end
+
+        local decodeSuccess, parsed = pcall(function()
+            return HttpService:JSONDecode(body)
+        end)
+
+        if not decodeSuccess or not parsed or not parsed.data then
+            setStatus("Malformed response from Roblox API.", Color3.fromRGB(239, 68, 68))
+            EmptyLabel.Text = "Could not parse server list JSON."
+            if onComplete then onComplete(false) end
+            return
+        end
+
+        nextPageCursor = parsed.nextPageCursor or ""
+
+        if not cursor or cursor == "" then
+            loadedSoloServers = {}
+        end
+
+        for _, srv in ipairs(parsed.data) do
+            -- Only record instances that have EXACTLY 1 PLAYER
+            if srv.playing == 1 then
+                local exists = false
+                for _, existing in ipairs(loadedSoloServers) do
+                    if existing.id == srv.id then
+                        exists = true
+                        break
+                    end
+                end
+                if not exists then
+                    table.insert(loadedSoloServers, srv)
+                end
+            end
+        end
+
+        renderSoloList()
+        if onComplete then onComplete(true) end
+    end)
+end
+
+-- ========================================================================
+-- 1-PLAYER AUTO-JOIN WATCHDOG & FALLBACK ENGINE
+-- ========================================================================
+
+stopJoining = function(reason)
+    isJoining = false
+    currentJoinIndex = 1
+    soloCandidates = {}
+    AutoJoinSoloBtn.Text = "Join 1-Player Server (Auto)"
+    AutoJoinSoloBtn.BackgroundColor3 = Color3.fromRGB(124, 58, 237)
+
+    if reason then
+        notify("Solo Hop", reason, 4)
+        setStatus(reason, Color3.fromRGB(239, 68, 68))
+    end
+end
+
+executeJoinAttempt = function()
+    if not isJoining then return end
+
+    -- Advance past any blacklisted or current server
+    while currentJoinIndex <= #soloCandidates do
+        local candidate = soloCandidates[currentJoinIndex]
+        if candidate and not blacklistServers[candidate.id] and candidate.id ~= CurrentJobId then
+            break
+        end
+        currentJoinIndex = currentJoinIndex + 1
+    end
+
+    if currentJoinIndex > #soloCandidates then
+        stopJoining("All 1-player candidate servers attempted. Refresh to rescan.")
+        return
+    end
+
+    local target = soloCandidates[currentJoinIndex]
+    local pingText = target.ping and string.format("%d ms", math.floor(target.ping)) or "N/A"
+
+    local msg = string.format("Joining 1-Player Server #%d (Ping: %s)...", currentJoinIndex, pingText)
+    setStatus(msg, Color3.fromRGB(245, 158, 11))
+    notify("Solo Hop", msg, 3)
+
+    setupQueueOnTeleport()
+
+    local success, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(PlaceId, target.id, LocalPlayer)
+    end)
+
+    if not success then
+        blacklistServers[target.id] = true
+        currentJoinIndex = currentJoinIndex + 1
+        setStatus(string.format("Server #%d failed. Trying next 1-player server...", currentJoinIndex - 1), Color3.fromRGB(239, 68, 68))
+        task.wait(1)
+        executeJoinAttempt()
+    else
+        -- 8-second watchdog
+        task.delay(8, function()
+            if isJoining and currentJoinIndex <= #soloCandidates and soloCandidates[currentJoinIndex].id == target.id then
+                setStatus("Connection timeout. Retrying next 1-player server...", Color3.fromRGB(245, 158, 11))
+                blacklistServers[target.id] = true
+                currentJoinIndex = currentJoinIndex + 1
+                executeJoinAttempt()
+            end
+        end)
+    end
+end
+
+-- Teleport Failure Listener (Advances down 1-player queue on ghost/closed server)
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+    if player == LocalPlayer then
+        local errStr = tostring(errorMessage or "Server closed or full")
+        if isJoining and currentJoinIndex <= #soloCandidates then
+            local failedServer = soloCandidates[currentJoinIndex]
+            if failedServer then
+                blacklistServers[failedServer.id] = true
+            end
+            currentJoinIndex = currentJoinIndex + 1
+            setStatus(string.format("Server #%d closed. Trying next 1-player server...", currentJoinIndex - 1), Color3.fromRGB(239, 68, 68))
+            notify("Solo Hop", "Server was closed. Retrying next 1-player server...", 3)
+            task.wait(0.5)
+            executeJoinAttempt()
+        else
+            setStatus("Teleport failed: " .. errStr, Color3.fromRGB(239, 68, 68))
+            notify("Teleport Failed", errStr, 4)
+        end
+    end
+end)
+
+startSoloJoin = function()
+    if isJoining then
+        stopJoining("Auto-join canceled by user.")
+        return
+    end
+
+    isJoining = true
+    currentJoinIndex = 1
+    AutoJoinSoloBtn.Text = "Cancel Auto Join"
+    AutoJoinSoloBtn.BackgroundColor3 = Color3.fromRGB(225, 29, 72)
+    setStatus("Building sorted 1-player queue...", Color3.fromRGB(192, 132, 252))
+
+    soloCandidates = {}
+    for _, srv in ipairs(loadedSoloServers) do
+        if (srv.playing == 1) and (srv.id ~= CurrentJobId) and not blacklistServers[srv.id] then
+            table.insert(soloCandidates, srv)
+        end
+    end
+
+    -- Sort lowest latency first
+    table.sort(soloCandidates, function(a, b)
+        local aPing = a.ping or 9999
+        local bPing = b.ping or 9999
+        return aPing < bPing
+    end)
+
+    if #soloCandidates > 0 then
+        executeJoinAttempt()
+        return
+    end
+
+    -- If none loaded yet, fetch directly from Roblox API
+    fetchRobloxServers("", function(ok)
+        if not ok or not isJoining then
+            if isJoining then stopJoining("Failed to query Roblox servers.") end
+            return
+        end
+
+        soloCandidates = {}
+        for _, srv in ipairs(loadedSoloServers) do
+            if (srv.playing == 1) and (srv.id ~= CurrentJobId) and not blacklistServers[srv.id] then
+                table.insert(soloCandidates, srv)
+            end
+        end
+
+        table.sort(soloCandidates, function(a, b)
+            local aPing = a.ping or 9999
+            local bPing = b.ping or 9999
+            return aPing < bPing
+        end)
+
+        if #soloCandidates > 0 then
+            executeJoinAttempt()
+        else
+            stopJoining("No 1-player servers found right now. Try again shortly.")
+        end
+    end)
+end
+
+-- ========================================================================
+-- EVENT HOOKS
+-- ========================================================================
+
+AutoJoinSoloBtn.MouseButton1Click:Connect(function()
+    startSoloJoin()
+end)
+
+RefreshBtn.MouseButton1Click:Connect(function()
+    if isJoining then
+        stopJoining("Rescanning servers...")
+    end
+    fetchRobloxServers("")
+end)
+
+LoadMoreBtn.MouseButton1Click:Connect(function()
+    if isFetching or isJoining then return end
+    if nextPageCursor and nextPageCursor ~= "" then
+        fetchRobloxServers(nextPageCursor)
+    else
+        setStatus("No more server pages available.", Color3.fromRGB(245, 158, 11))
+    end
+end)
+
+-- Auto-search and instant join sequence on launch
+task.spawn(function()
+    task.wait(0.3)
+    fetchRobloxServers("", function(ok)
+        -- Auto-start joining the first 1-player server
+        if ok and not isJoining then
+            startSoloJoin()
+        end
+    end)
+end)
+
+print("[Solo Hop] Loaded successfully. Exclusively targeting 1-player instances.")
